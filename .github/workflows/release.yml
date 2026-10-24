@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python and package the agent
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build standalone Python agent
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          python -m PyInstaller --noconfirm --clean --onefile --name lockstep-agent --distpath build/sidecar --workpath build/pyinstaller --specpath build/pyinstaller --collect-all valclient main.py
+
+      - name: Install frontend packages
+        run: npm ci
+
+      - name: Configure this repository as the update feed
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $config = @{
+            bundle = @{ resources = @{ "../build/sidecar/lockstep-agent.exe" = "agent/lockstep-agent.exe" } }
+            plugins = @{ updater = @{ endpoints = @("https://github.com/$repo/releases/latest/download/latest.json") } }
+          }
+          $config | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 src-tauri/tauri.release.conf.json
+
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+
+      - name: Build signed installer and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Lockstep ${{ github.ref_name }}"
+          releaseBody: "Download Lockstep-Setup from the release assets."
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --config src-tauri/tauri.release.conf.json

@@ -1,0 +1,170 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use serde::Serialize;
+use std::{io::{BufRead, BufReader}, path::PathBuf, process::{Child, Command, Stdio}, sync::Mutex, thread, time::Duration};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use tauri::{AppHandle, Emitter, Manager, State};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+struct AgentProcess(Mutex<Option<Child>>);
+
+#[derive(Clone, Serialize)]
+struct AgentStatus { running: bool }
+
+fn agent_runtime(app: &AppHandle) -> Result<(PathBuf, bool), String> {
+    if let Ok(resources) = app.path().resource_dir() {
+        let bundled = resources.join("agent").join("lockstep-agent.exe");
+        if bundled.exists() {
+            return Ok((bundled, true));
+        }
+    }
+
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("main.py");
+    if development.exists() {
+        return Ok((development, false));
+    }
+
+    Err("Der Lockstep-Agent fehlt. Bitte installiere das vollständige Setup erneut.".into())
+}
+
+#[tauri::command]
+fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String, agent_name: String, region: String, map_rules: String, discord_webhook: Option<String>) -> Result<(), String> {
+    let mut process = state.0.lock().map_err(|e| e.to_string())?;
+    if process.is_some() { return Err("Der Agent läuft bereits.".into()); }
+
+    let (runtime, bundled) = agent_runtime(&app)?;
+    let candidates: Vec<(&str, Vec<&str>)> = if bundled {
+        vec![(runtime.to_str().ok_or("Ungültiger Pfad zum Lockstep-Agent.")?, vec![])]
+    } else if cfg!(windows) {
+        vec![("py", vec!["-3"]), ("python", vec![])]
+    } else {
+        vec![("python3", vec![])]
+    };
+
+    let mut started = None;
+    let mut last_spawn_error = None;
+    for (program, prefix_args) in candidates {
+        let mut command = Command::new(program);
+        command.args(prefix_args);
+        if !bundled {
+            command.arg(&runtime);
+        }
+        if let Some(webhook) = discord_webhook.as_ref().filter(|url| !url.trim().is_empty()) {
+            command.env("LOCKSTEP_DISCORD_WEBHOOK", webhook);
+        }
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        match command
+            .arg("--agent-id").arg(&agent_id)
+            .arg("--agent-name").arg(&agent_name)
+            .arg("--region").arg(&region)
+            .arg("--rules").arg(&map_rules)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+        {
+            Ok(child) => {
+                started = Some(child);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => last_spawn_error = Some(error),
+            Err(error) => return Err(format!("Lockstep-Agent konnte nicht gestartet werden: {error}")),
+        }
+    }
+    let mut child = started.ok_or_else(|| {
+        if bundled {
+            format!("Lockstep-Agent konnte nicht gestartet werden: {}", last_spawn_error.map(|e| e.to_string()).unwrap_or_else(|| "Datei nicht gefunden".into()))
+        } else {
+            "Python 3 wurde nicht gefunden. Installiere Python 3 oder verwende das vollständige Lockstep-Setup.".into()
+        }
+    })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    *process = Some(child);
+    drop(process);
+
+    if let Some(pipe) = stdout { read_output(app.clone(), pipe, false); }
+    if let Some(pipe) = stderr { read_output(app.clone(), pipe, true); }
+
+    let app_for_monitor = app.clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(400));
+        let Some(state) = app_for_monitor.try_state::<AgentProcess>() else { break };
+        let Ok(mut process) = state.0.lock() else { break };
+        let Some(child) = process.as_mut() else { break };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *process = None;
+                let message = if status.success() { "Agent beendet.".to_string() } else { format!("Agent beendet mit Status {status}.") };
+                let _ = app_for_monitor.emit("agent-log", message);
+                let _ = app_for_monitor.emit("agent-status", AgentStatus { running: false });
+                break;
+            }
+            Err(error) => {
+                *process = None;
+                let _ = app_for_monitor.emit("agent-log", format!("Prozessfehler: {error}"));
+                let _ = app_for_monitor.emit("agent-status", AgentStatus { running: false });
+                break;
+            }
+            _ => {}
+        }
+    });
+    let _ = app.emit("agent-status", AgentStatus { running: true });
+    Ok(())
+}
+
+fn read_output(app: AppHandle, pipe: impl std::io::Read + Send + 'static, is_error: bool) {
+    thread::spawn(move || {
+        for line in BufReader::new(pipe).lines().flatten() {
+            if let Some(snapshot) = line.strip_prefix("TRACK:") {
+                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(snapshot) {
+                    let _ = app.emit("agent-track", payload);
+                    continue;
+                }
+            }
+            let text = if is_error { format!("Fehler: {line}") } else { line };
+            let _ = app.emit("agent-log", text);
+        }
+    });
+}
+
+#[tauri::command]
+fn stop_agent(app: AppHandle, state: State<'_, AgentProcess>) -> Result<(), String> {
+    let mut process = state.0.lock().map_err(|e| e.to_string())?;
+    let child = process.take();
+    drop(process);
+
+    if let Some(mut child) = child {
+        if child.try_wait().map_err(|e| format!("Prozessstatus konnte nicht gelesen werden: {e}"))?.is_none() {
+            #[cfg(windows)]
+            {
+                let pid = child.id().to_string();
+                let mut taskkill = Command::new("taskkill");
+                taskkill.args(["/PID", &pid, "/T", "/F"]);
+                taskkill.creation_flags(CREATE_NO_WINDOW);
+                let tree_stopped = taskkill.status().map(|status| status.success()).unwrap_or(false);
+                if !tree_stopped && child.try_wait().ok().flatten().is_none() {
+                    child.kill().map_err(|e| format!("Agent konnte nicht gestoppt werden: {e}"))?;
+                }
+            }
+            #[cfg(not(windows))]
+            child.kill().map_err(|e| format!("Agent konnte nicht gestoppt werden: {e}"))?;
+        }
+        child.wait().map_err(|e| format!("Agent-Prozess konnte nicht beendet werden: {e}"))?;
+    }
+    let _ = app.emit("agent-log", "Lock-Vorgang gestoppt.");
+    let _ = app.emit("agent-status", AgentStatus { running: false });
+    Ok(())
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .manage(AgentProcess(Mutex::new(None)))
+        .invoke_handler(tauri::generate_handler![start_agent, stop_agent])
+        .run(tauri::generate_context!())
+        .expect("Fehler beim Starten von Lockstep");
+}
