@@ -16,6 +16,48 @@ import requests
 
 LOBBY_STATE: dict[str, Any] = {"phase": "MENUS", "mapName": "", "agentName": "", "timerSeconds": None, "players": []}
 LOBBY_LOCK = Lock()
+MAP_NAME_FALLBACKS = {
+    "7eaecc1b-4337-bbf6-6ab9-04b8f06b3319": "Ascent",
+    "ascent": "Ascent",
+    "d960549e-485c-e861-8d71-aa9d1aed12a2": "Split",
+    "bonsai": "Split",
+    "b529448b-4d60-346e-e89e-00a4c527a405": "Fracture",
+    "canyon": "Fracture",
+    "2c9d57ec-4431-9c5e-2939-8f9ef6dd5cba": "Bind",
+    "duality": "Bind",
+    "2fb9a4fd-47b8-4e7d-a969-74b4046ebd53": "Breeze",
+    "foxtrot": "Breeze",
+    "690b3ed2-4dff-945b-8223-6da834e30d24": "District",
+    "hurm-alley": "District",
+    "12452a9d-48c3-0b02-e7eb-0381c3520404": "Kasbah",
+    "hurm-bowl": "Kasbah",
+    "2c09d728-42d5-30d8-43dc-96a05cc7ee9d": "Drift",
+    "hurm-helix": "Drift",
+    "d6336a5a-428f-c591-98db-c8a291159134": "Glitch",
+    "hurm-hightide": "Glitch",
+    "de28aa9b-4cbe-1003-320e-6cb3ec309557": "Piazza",
+    "hurm-yard": "Piazza",
+    "224b0a95-48b9-f703-1bd8-67aca101a61f": "Abyss",
+    "infinity": "Abyss",
+    "2fe4ed3a-450a-948b-6d6b-e89a78e680a9": "Lotus",
+    "jam": "Lotus",
+    "92584fbe-486a-b1b2-9faa-39b0f486b498": "Sunset",
+    "juliett": "Sunset",
+    "fd267378-4d1d-484f-ff52-77821ed10dc2": "Pearl",
+    "pitt": "Pearl",
+    "756da597-416b-c0f2-f47b-afbdf28670bc": "Summit",
+    "plummet": "Summit",
+    "e2ad5c54-4114-a870-9641-8ea21279579a": "Icebox",
+    "port": "Icebox",
+    "ee613ee9-28b7-4beb-9666-08db13bb2244": "The Range",
+    "5914d1e0-40c4-cfdd-6b88-eba06347686c": "The Range",
+    "poveglia": "The Range",
+    "the-range": "The Range",
+    "1c18ab1f-420d-0d8b-71d0-77ad3c439115": "Corrode",
+    "rook": "Corrode",
+    "2bee0dc9-4ffe-519b-1cbd-7fbe763a6047": "Haven",
+    "triad": "Haven",
+}
 
 
 class LobbyHandler(BaseHTTPRequestHandler):
@@ -97,11 +139,11 @@ def canonical_id(value: Any) -> str:
 def map_slug(value: Any) -> str:
     """Normalize Riot map IDs, URLs, and display names to the catalog slug."""
     text = str(value or "").strip().replace("\\", "/")
-    # Riot content IDs often look like /Game/Maps/Ascent/Ascent; the map name
-    # is the directory immediately after /Maps/, not the final asset filename.
-    match = re.search(r"(?:^|/)Maps/([^/]+)", text, re.IGNORECASE)
+    # Some modes add a HURM subfolder, where the mode folder alone is not the map.
+    match = re.search(r"(?:^|/)Maps/([^/]+)(?:/([^/]+))?", text, re.IGNORECASE)
     if match:
-        text = match.group(1)
+        folder = match.group(1)
+        text = match.group(2) if folder.casefold() == "hurm" and match.group(2) else folder
     else:
         text = text.rstrip("/").rsplit("/", 1)[-1]
         text = re.sub(r"\.[^.]+$", "", text)
@@ -113,11 +155,13 @@ def resolve_map_name(map_id: Any, map_names: dict[str, str]) -> str:
     canonical = canonical_id(raw)
     if canonical in map_names:
         return map_names[canonical]
+    if canonical in MAP_NAME_FALLBACKS:
+        return MAP_NAME_FALLBACKS[canonical]
     slug = map_slug(raw)
     for content_id, name in map_names.items():
         if slug and (map_slug(content_id) == slug or map_slug(name) == slug):
             return name
-    return ""
+    return MAP_NAME_FALLBACKS.get(slug, "")
 
 
 def competitive_tier(mmr: dict[str, Any]) -> int:
@@ -350,6 +394,8 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
     lock_delay_announced_id = ""
     match_id = ""
     previous_phase = ""
+    tracked_map_id = ""
+    tracked_map_name = ""
     active_agent_id = agent_id
     active_agent_name = agent_name
     players: list[dict[str, Any]] = []
@@ -418,6 +464,8 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                     final_stats_attempts = 0
                     last_final_attempt = 0.0
                     match_id = ""
+                    tracked_map_id = ""
+                    tracked_map_name = ""
                 players = normalize_players(match_data, agent_names)
                 map_id = str(match_data.get("MapID") or match_data.get("mapId") or "")
                 map_name = resolve_map_name(map_id, map_names)
@@ -509,10 +557,21 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                 pregame_id = ""
             previous_phase = phase
 
-            map_id = match_data.get("MapID") or match_data.get("mapId") or ""
-            map_name = resolve_map_name(map_id, map_names)
-            if phase in ("MENUS", "UNKNOWN"):
-                map_id, map_name = "", ""
+            reported_map_id = match_data.get("MapID") or match_data.get("mapId") or ""
+            if reported_map_id:
+                reported_map_id = str(reported_map_id)
+                if canonical_id(reported_map_id) != canonical_id(tracked_map_id):
+                    tracked_map_id = reported_map_id
+                    tracked_map_name = ""
+
+            if phase == "MENUS":
+                tracked_map_id = ""
+                tracked_map_name = ""
+            elif tracked_map_id:
+                tracked_map_name = resolve_map_name(tracked_map_id, map_names) or tracked_map_name
+
+            map_id = tracked_map_id
+            map_name = tracked_map_name
             timer_ns = match_data.get("PhaseTimeRemainingNS")
             snapshot = {
                 "phase": phase,
