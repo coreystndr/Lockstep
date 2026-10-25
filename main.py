@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
+import socket
 import time
 from threading import Thread, Lock
 from typing import Any
@@ -62,7 +63,18 @@ MAP_NAME_FALLBACKS = {
 
 class LobbyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path == "/api/state":
+        if self.path == "/api/mobile-url":
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                try:
+                    probe.connect(("192.0.2.1", 80))
+                    address = probe.getsockname()[0]
+                except OSError:
+                    address = "127.0.0.1"
+            body = json.dumps({"url": f"http://{address}:47831/"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif self.path == "/api/state":
             with LOBBY_LOCK:
                 body = json.dumps(LOBBY_STATE).encode("utf-8")
             self.send_response(200)
@@ -82,7 +94,7 @@ class LobbyHandler(BaseHTTPRequestHandler):
 
 def start_lobby_server() -> None:
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", 47831), LobbyHandler)
+        server = ThreadingHTTPServer(("0.0.0.0", 47831), LobbyHandler)
         Thread(target=server.serve_forever, daemon=True).start()
     except OSError:
         pass

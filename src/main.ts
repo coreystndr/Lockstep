@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import QRCode from "qrcode";
 import { agents as fullAgentCatalog, maps as fullMapCatalog, type CatalogItem } from "./catalog";
 import "./style.css";
 
@@ -66,6 +67,7 @@ app.innerHTML = `
             <select id="region">${regions.map(([value, label]) => `<option value="${value}" ${value === "eu" ? "selected" : ""}>${label}</option>`).join("")}</select>
           </label>
         </div>
+        <div id="agent-picker" class="agent-picker" role="group" aria-label="Agent auswählen">${sortedAgents.map((agent) => `<button class="agent-choice ${agent.id === sage.id ? "is-selected" : ""}" type="button" data-agent-id="${escapeHtml(agent.id)}" aria-pressed="${agent.id === sage.id}">${escapeHtml(agent.name)}</button>`).join("")}</div>
         <div class="map-rule-builder">
           <label class="field">
             <span>Map</span>
@@ -80,7 +82,7 @@ app.innerHTML = `
         <div id="map-rules" class="map-rules" aria-live="polite"></div>
         <div class="web-tools">
           <label class="field webhook-field"><span>Discord Webhook</span><input id="discord-webhook" type="url" autocomplete="off" spellcheck="false" placeholder="https://discord.com/api/webhooks/…"></label>
-          <div class="lobby-link"><span>Live-Lobby im Browser</span><a href="http://127.0.0.1:47831/" target="_blank" rel="noreferrer">http://127.0.0.1:47831/</a><small>Nur auf diesem PC erreichbar, solange der Lock läuft.</small></div>
+          <div class="lobby-link"><span>Live-Lobby im Browser</span><a id="lobby-url" href="http://127.0.0.1:47831/" target="_blank" rel="noreferrer">http://127.0.0.1:47831/</a><small>QR-Code für dein Handy, solange der Lock läuft:</small><button id="show-mobile-qr" class="secondary-button mobile-qr-button" type="button">Handy-QR anzeigen</button><div id="mobile-qr" class="mobile-qr" hidden><canvas id="mobile-qr-canvas" aria-label="QR-Code für die mobile Lobby"></canvas><span id="mobile-qr-status">Verbinde …</span></div></div>
         </div>
         <div class="action-row">
           <div class="action-note"><span class="key-hint">${running ? "RUNNING" : "AUTO"}</span><span id="action-copy">${running ? "Suche nach einem Match" : "Sobald das Match startet, wird der Agent gewählt."}</span></div>
@@ -131,12 +133,56 @@ app.innerHTML = `
   </div>`;
 
 const agentSelect = document.querySelector<HTMLSelectElement>("#agent-select")!;
+const agentPicker = document.querySelector<HTMLDivElement>("#agent-picker")!;
 const regionSelect = document.querySelector<HTMLSelectElement>("#region")!;
 const ruleMapSelect = document.querySelector<HTMLSelectElement>("#rule-map")!;
 const ruleAgentSelect = document.querySelector<HTMLSelectElement>("#rule-agent")!;
 const button = document.querySelector<HTMLButtonElement>("#toggle-agent")!;
 const webhookInput = document.querySelector<HTMLInputElement>("#discord-webhook")!;
 const updateButton = document.querySelector<HTMLButtonElement>("#check-updates")!;
+const mobileQrButton = document.querySelector<HTMLButtonElement>("#show-mobile-qr")!;
+const mobileQr = document.querySelector<HTMLDivElement>("#mobile-qr")!;
+const mobileQrCanvas = document.querySelector<HTMLCanvasElement>("#mobile-qr-canvas")!;
+const mobileQrStatus = document.querySelector<HTMLSpanElement>("#mobile-qr-status")!;
+
+agentPicker.addEventListener("click", (event) => {
+  const choice = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-agent-id]");
+  if (!choice || choice.disabled) return;
+  agentSelect.value = choice.dataset.agentId!;
+  agentSelect.dispatchEvent(new Event("change", { bubbles: true }));
+});
+agentSelect.addEventListener("change", () => {
+  agentPicker.querySelectorAll<HTMLButtonElement>("[data-agent-id]").forEach((choice) => {
+    const selected = choice.dataset.agentId === agentSelect.value;
+    choice.classList.toggle("is-selected", selected);
+    choice.setAttribute("aria-pressed", String(selected));
+  });
+});
+mobileQrButton.addEventListener("click", async () => {
+  mobileQr.hidden = false;
+  mobileQrStatus.textContent = "Verbinde …";
+  mobileQrButton.disabled = true;
+  try {
+    let url = "";
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        const response = await fetch("http://127.0.0.1:47831/api/mobile-url");
+        if (response.ok) { url = (await response.json() as { url: string }).url; break; }
+      } catch { /* The lobby server may still be starting. */ }
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+    if (!url || url.includes("127.0.0.1")) throw new Error("Keine WLAN-Adresse gefunden");
+    await QRCode.toCanvas(mobileQrCanvas, url, { width: 176, margin: 1, color: { dark: "#191a17", light: "#ffffff" } });
+    const link = document.querySelector<HTMLAnchorElement>("#lobby-url")!;
+    link.href = url;
+    link.textContent = url;
+    mobileQrStatus.textContent = "Handy und PC müssen im selben WLAN sein.";
+  } catch {
+    mobileQrStatus.textContent = "Nicht erreichbar. Starte zuerst den Lock und versuche es erneut.";
+  } finally {
+    mobileQrButton.disabled = false;
+  }
+});
 
 updateButton.addEventListener("click", async () => {
   updateButton.disabled = true;
@@ -268,6 +314,7 @@ function setRunning(value: boolean) {
     document.querySelector("#live-phase")!.textContent = "Verbinde …";
   }
   for (const field of [agentSelect, regionSelect, ruleMapSelect, ruleAgentSelect, webhookInput, document.querySelector<HTMLButtonElement>("#save-rule")!]) field.disabled = value;
+  agentPicker.querySelectorAll<HTMLButtonElement>(".agent-choice").forEach((choice) => { choice.disabled = value; });
   document.querySelectorAll<HTMLButtonElement>("[data-remove-rule]").forEach((removeButton) => { removeButton.disabled = value; });
 }
 
