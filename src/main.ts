@@ -82,7 +82,7 @@ app.innerHTML = `
         <div id="map-rules" class="map-rules" aria-live="polite"></div>
         <div class="web-tools">
           <label class="field webhook-field"><span>Discord Webhook</span><input id="discord-webhook" type="url" autocomplete="off" spellcheck="false" placeholder="https://discord.com/api/webhooks/…"></label>
-          <div class="lobby-link"><span>Live-Lobby im Browser</span><a id="lobby-url" href="http://127.0.0.1:47831/" target="_blank" rel="noreferrer">http://127.0.0.1:47831/</a><small>QR-Code für dein Handy, solange der Lock läuft:</small><button id="show-mobile-qr" class="secondary-button mobile-qr-button" type="button">Handy-QR anzeigen</button><div id="mobile-qr" class="mobile-qr" hidden><canvas id="mobile-qr-canvas" aria-label="QR-Code für die mobile Lobby"></canvas><span id="mobile-qr-status">Verbinde …</span></div></div>
+          <div class="lobby-link"><span>Live-Lobby im Browser</span><a id="lobby-url" href="#" target="_blank" rel="noreferrer">Wird beim Start angezeigt</a><small>QR-Code für dein Handy, solange der Lock läuft:</small><button id="show-mobile-qr" class="secondary-button mobile-qr-button" type="button">Handy-QR anzeigen</button><div id="mobile-qr" class="mobile-qr" hidden><canvas id="mobile-qr-canvas" aria-label="QR-Code für die mobile Lobby"></canvas><span id="mobile-qr-status" role="status" aria-live="polite">Verbinde …</span></div></div>
         </div>
         <div class="action-row">
           <div class="action-note"><span class="key-hint">${running ? "RUNNING" : "AUTO"}</span><span id="action-copy">${running ? "Suche nach einem Match" : "Sobald das Match startet, wird der Agent gewählt."}</span></div>
@@ -172,10 +172,14 @@ mobileQrButton.addEventListener("click", async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
     if (!url || url.includes("127.0.0.1")) throw new Error("Keine WLAN-Adresse gefunden");
-    await QRCode.toCanvas(mobileQrCanvas, url, { width: 176, margin: 1, color: { dark: "#191a17", light: "#ffffff" } });
+    const parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== "http:" || !parsedUrl.port || parsedUrl.hostname === "localhost" || parsedUrl.hostname.startsWith("127.")) {
+      throw new Error("Die Lobby-Adresse ist keine WLAN-Adresse");
+    }
+    await QRCode.toCanvas(mobileQrCanvas, parsedUrl.href, { width: 240, margin: 4, errorCorrectionLevel: "M", color: { dark: "#111210", light: "#ffffff" } });
     const link = document.querySelector<HTMLAnchorElement>("#lobby-url")!;
-    link.href = url;
-    link.textContent = url;
+    link.href = parsedUrl.href;
+    link.textContent = parsedUrl.href;
     mobileQrStatus.textContent = "Handy und PC müssen im selben WLAN sein.";
   } catch {
     mobileQrStatus.textContent = "Nicht erreichbar. Starte zuerst den Lock und versuche es erneut.";
