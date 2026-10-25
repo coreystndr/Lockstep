@@ -105,8 +105,8 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.35px; }
 .player-name { font-weight: 600; }
 .player-name small { display: block; margin-top: 3px; color: #aaa99f; font-size: 9px; font-weight: 400; }
 .team-name { color: #d0cfc7; }
-.team-name.red { color: #f0aaa3; }
-.team-name.blue { color: #a9d3e8; }
+.team-name.attacker { color: #f0aaa3; }
+.team-name.defender { color: #a9d3e8; }
 .rank-label { color: #f0c27b; }
 .stats-note { margin: 9px 0 0; color: #aaa99f; font-size: 10px; }
 .activity { margin-top: 36px; }

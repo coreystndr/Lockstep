@@ -33,7 +33,7 @@ fn agent_runtime(app: &AppHandle) -> Result<(PathBuf, bool), String> {
 }
 
 #[tauri::command]
-fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String, agent_name: String, region: String, map_rules: String, discord_webhook: Option<String>) -> Result<(), String> {
+fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String, agent_name: String, region: String, map_rules: String, discord_webhook: Option<String>, agent_catalog: String) -> Result<(), String> {
     let mut process = state.0.lock().map_err(|e| e.to_string())?;
     if process.is_some() { return Err("Der Agent läuft bereits.".into()); }
 
@@ -64,6 +64,7 @@ fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String,
             .arg("--agent-name").arg(&agent_name)
             .arg("--region").arg(&region)
             .arg("--rules").arg(&map_rules)
+            .arg("--agents").arg(&agent_catalog)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         {
@@ -120,7 +121,7 @@ fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String,
 }
 
 #[tauri::command]
-fn set_auto_lock(app: AppHandle, state: State<'_, AgentProcess>, enabled: bool, agent_id: String, agent_name: String, map_rules: String, discord_webhook: Option<String>) -> Result<(), String> {
+fn set_auto_lock(app: AppHandle, state: State<'_, AgentProcess>, enabled: bool, agent_id: String, agent_name: String, map_rules: String, discord_webhook: Option<String>, agent_catalog: String) -> Result<(), String> {
     let mut process = state.0.lock().map_err(|e| e.to_string())?;
     let agent = process.as_mut().ok_or("Der Tracking-Dienst ist noch nicht gestartet.")?;
     let command = serde_json::json!({
@@ -130,6 +131,7 @@ fn set_auto_lock(app: AppHandle, state: State<'_, AgentProcess>, enabled: bool, 
         "agentName": agent_name,
         "mapRules": map_rules,
         "discordWebhook": discord_webhook.unwrap_or_default(),
+        "agentCatalog": agent_catalog,
     });
     writeln!(agent.input, "{command}").map_err(|error| format!("Auto-Lock konnte nicht aktualisiert werden: {error}"))?;
     agent.input.flush().map_err(|error| format!("Auto-Lock-Befehl konnte nicht gesendet werden: {error}"))?;
@@ -138,7 +140,7 @@ fn set_auto_lock(app: AppHandle, state: State<'_, AgentProcess>, enabled: bool, 
 }
 
 #[tauri::command]
-fn update_agent_config(state: State<'_, AgentProcess>, agent_id: String, agent_name: String, map_rules: String, discord_webhook: Option<String>) -> Result<(), String> {
+fn update_agent_config(state: State<'_, AgentProcess>, agent_id: String, agent_name: String, map_rules: String, discord_webhook: Option<String>, agent_catalog: String) -> Result<(), String> {
     let mut process = state.0.lock().map_err(|e| e.to_string())?;
     let agent = process.as_mut().ok_or("Der Tracking-Dienst läuft noch nicht.")?;
     let command = serde_json::json!({
@@ -147,6 +149,7 @@ fn update_agent_config(state: State<'_, AgentProcess>, agent_id: String, agent_n
         "agentName": agent_name,
         "mapRules": map_rules,
         "discordWebhook": discord_webhook.unwrap_or_default(),
+        "agentCatalog": agent_catalog,
     });
     writeln!(agent.input, "{command}").map_err(|error| format!("Konfiguration konnte nicht aktualisiert werden: {error}"))?;
     agent.input.flush().map_err(|error| format!("Konfiguration konnte nicht gesendet werden: {error}"))?;

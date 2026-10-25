@@ -97,7 +97,7 @@ app.innerHTML = `
       <section class="live-panel" aria-labelledby="live-heading">
         <div class="live-heading">
           <div><p class="section-index">02 <span>/ MATCH TRACKER</span></p><h2 id="live-heading">Live tracking</h2></div>
-          <div class="live-state"><i id="live-indicator"></i><span id="live-phase">Noch nicht verbunden</span></div>
+          <div class="live-state"><i id="live-indicator"></i><span id="live-phase">Warte auf VALORANT-Verbindung</span></div>
         </div>
         <div class="live-data">
           <div class="live-item"><span>MAP</span><strong id="live-map">—</strong></div>
@@ -155,6 +155,7 @@ function agentConfig() {
     region: regionSelect.value,
     mapRules: JSON.stringify(mapRules),
     discordWebhook: webhookInput.value.trim() || null,
+    agentCatalog: JSON.stringify(agents.map(({ id, name }) => ({ id, name }))),
   };
 }
 
@@ -315,7 +316,7 @@ function renderPlayers(players: PlayerSnapshot[]) {
   frame.innerHTML = `<table class="roster-table"><thead><tr><th>Spieler</th><th>Team</th><th>Agent</th><th>Rang</th><th>K</th><th>T</th><th>A</th><th>Score</th></tr></thead><tbody>${players.map((player, index) => `
     <tr>
       <td class="player-name">${escapeHtml(player.name || `Spieler ${index + 1}`)}${player.accountLevel ? `<small>Lv. ${player.accountLevel}</small>` : ""}</td>
-      <td><span class="team-name ${String(player.team).toLowerCase()}">${escapeHtml(teamLabel(player.team))}</span></td>
+      <td><span class="team-name ${teamClass(player.team)}">${escapeHtml(teamLabel(player.team))}</span></td>
       <td>${escapeHtml(player.agentName || "—")}</td>
       <td><span class="rank-label">${escapeHtml(rankName(player.rankTier))}</span></td>
       <td>${displayStat(player.kills)}</td><td>${displayStat(player.deaths)}</td><td>${displayStat(player.assists)}</td><td>${displayStat(player.score)}</td>
@@ -328,9 +329,16 @@ function displayStat(value: number | null | undefined) {
 
 function teamLabel(team: string | undefined) {
   const value = String(team || "");
-  if (value.toLowerCase() === "blue") return "Blau · Verteidiger";
-  if (value.toLowerCase() === "red") return "Rot · Angreifer";
+  if (["blue", "defender"].includes(value.toLowerCase())) return "Defender";
+  if (["red", "attacker"].includes(value.toLowerCase())) return "Attacker";
   return value || "—";
+}
+
+function teamClass(team: string | undefined) {
+  const value = String(team || "").toLowerCase();
+  if (["blue", "defender"].includes(value)) return "defender";
+  if (["red", "attacker"].includes(value)) return "attacker";
+  return "";
 }
 
 function addLog(text: string) {
@@ -348,7 +356,7 @@ function setAgentStatus(value: boolean, service: boolean) {
   button.disabled = !service;
   button.innerHTML = `<span class="button-icon" aria-hidden="true">${running ? "■" : "▶"}</span><span>${running ? "Auto-Lock pausieren" : "Auto-Lock starten"}</span>`;
   document.querySelector("#connection-light")!.classList.toggle("is-live", service);
-  document.querySelector("#connection-label")!.textContent = service ? (running ? "Tracker aktiv · Auto-Lock an" : "Tracker aktiv") : "Tracker nicht aktiv";
+  document.querySelector("#connection-label")!.textContent = service ? (running ? "Dienst aktiv · Auto-Lock an" : "Dienst aktiv") : "Dienst nicht aktiv";
   document.querySelector("#auto-lock-state")!.textContent = running ? "AUTO-LOCK AN" : "AUTO-LOCK AUS";
   document.querySelector("#action-copy")!.textContent = running ? "Auto-Lock wartet auf ein Match." : service ? "Tracking und Lobby laufen im Hintergrund." : "Tracking-Dienst wird gestartet.";
   document.querySelector("#footer-state")!.textContent = running ? "Auto-Lock aktiv · warte auf Match" : service ? "Tracking und Lobby aktiv" : "Tracking-Dienst nicht aktiv";
@@ -394,9 +402,9 @@ const listenersReady = Promise.all([
   listen<{ running: boolean; serviceRunning: boolean }>("agent-status", (event) => setAgentStatus(event.payload.running, event.payload.serviceRunning)),
   listen<TrackSnapshot>("agent-track", (event) => {
   const snapshot = event.payload;
-  const phases: Record<string, string> = { PREGAME: "Agentenauswahl", INGAME: "Im Match", IN_GAME: "Im Match", MENUS: "Im Menü", UNKNOWN: "Status wird gesucht" };
+  const phases: Record<string, string> = { PREGAME: "Agentenauswahl", INGAME: "Im Match", IN_GAME: "Im Match", MENUS: "Im Menü", UNKNOWN: "Warte auf VALORANT-Verbindung" };
   const phase = snapshot.phase?.toUpperCase() || "UNKNOWN";
-  const live = phase !== "MENUS" && phase !== "UNKNOWN";
+  const live = phase !== "UNKNOWN";
   document.querySelector("#live-phase")!.textContent = phases[phase] || phase;
   document.querySelector("#live-indicator")!.classList.toggle("is-live", live);
   const mapEl = document.querySelector<HTMLElement>("#live-map")!;

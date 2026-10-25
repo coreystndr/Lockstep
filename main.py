@@ -1,14 +1,20 @@
 
 import argparse
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
+import ipaddress
+import io
 import json
 import os
 import re
+import secrets
 import socket
 import sys
 import time
 from threading import Event, Thread, Lock
 from typing import Any
+from urllib.parse import quote, urlsplit
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -18,6 +24,34 @@ import requests
 
 LOBBY_STATE: dict[str, Any] = {"phase": "MENUS", "mapName": "", "agentName": "", "timerSeconds": None, "players": []}
 LOBBY_LOCK = Lock()
+LOBBY_CONTROL_TOKEN = ""
+LOBBY_AGENTS: list[dict[str, str]] = []
+LOBBY_PENDING_PICK: dict[str, str] | None = None
+MOBILE_LOBBY_HTML = r'''<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#111210">
+<title>Lockstep Lobby</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#111210;color:#e8e9e5}*{box-sizing:border-box}body{margin:0}main{width:min(100% - 28px,760px);margin:0 auto;padding:28px 0 48px}.eyebrow,.dim{color:#aaa99f}.eyebrow{font:11px Consolas,monospace;letter-spacing:.08em}h1{margin:8px 0 20px;font-size:clamp(26px,7vw,36px)}h2{margin:0 0 8px;font-size:18px}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.meta span,.card{border:1px solid #45463e;border-radius:14px;background:#191a17}.meta span{padding:12px 10px;font-size:13px}.card{margin-top:16px;padding:16px}.dim{margin:4px 0 12px;font-size:13px}.agent-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.agent-button{min-height:48px;padding:8px;border:1px solid #56574e;border-radius:10px;background:#151613;color:#e8e9e5;font:inherit;font-size:14px;cursor:pointer}.agent-button:hover:not(:disabled){border-color:#d9a65b;background:#29251e}.agent-button:focus-visible{outline:3px solid #d9a65b;outline-offset:2px}.agent-button:disabled{opacity:.58;cursor:not-allowed}.agent-button.is-current{border-color:#d9a65b;color:#f0c27b}.status{min-height:22px;margin:12px 0 0;color:#d7d7d0;font-size:13px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:430px}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid #34352e;font-size:13px}th{color:#aaa99f;font-size:11px;font-weight:500}.team{color:#d9a65b}@media(max-width:480px){main{padding-top:20px}.meta{gap:6px}.meta span{padding:10px 7px;font-size:12px}.agent-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.card{padding:13px}}
+</style>
+</head>
+<body><main>
+<p class="eyebrow">LOCKSTEP / LOKALE LOBBY</p><h1 id="phase">Verbinde mit Lockstep …</h1>
+<div class="meta"><span id="map">Map —</span><span id="agent">Agent —</span><span id="timer">Timer —</span></div>
+<section class="card" aria-labelledby="pick-heading"><h2 id="pick-heading">Agent picken</h2><p class="dim" id="pick-hint">Die Auswahl ist während der Agentenauswahl verfügbar.</p><div class="agent-grid" id="agents"></div><p class="status" id="pick-status" role="status" aria-live="polite"></p></section>
+<section class="card" aria-labelledby="roster-heading"><h2 id="roster-heading">Spieler</h2><div class="table-wrap"><table><thead><tr><th>Spieler</th><th>Agent</th><th>Team</th></tr></thead><tbody id="players"><tr><td class="dim" colspan="3">Warte auf Spielerdaten …</td></tr></tbody></table></div></section>
+</main>
+<script>
+const token=new URLSearchParams(location.search).get('key')||'';let timerEnd=0;let state={};let pickSubmitting=false;
+function teamName(team){const value=String(team||'').toLowerCase();if(value==='blue'||value==='defender')return'Defender';if(value==='red'||value==='attacker')return'Attacker';return team||'—'}
+function setPicker(){document.querySelectorAll('.agent-button').forEach(button=>{button.disabled=!token||!state.canPick||pickSubmitting;button.classList.toggle('is-current',button.dataset.agentId===state.agentId)})}
+async function pickAgent(agent){const status=document.querySelector('#pick-status');status.textContent='Sende '+agent.name+' an VALORANT …';pickSubmitting=true;setPicker();try{const response=await fetch('/api/mobile-pick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:token,agentId:agent.id})});const result=await response.json();if(!response.ok)throw new Error(result.message||'Auswahl konnte nicht gesendet werden.');status.textContent=result.message||'Agent wird ausgewählt …'}catch(error){status.textContent=String(error.message||error)}finally{pickSubmitting=false;setPicker()}}
+async function loadAgents(){try{const response=await fetch('/api/agents');const list=await response.json();const container=document.querySelector('#agents');for(const agent of list){const button=document.createElement('button');button.className='agent-button';button.type='button';button.textContent=agent.name;button.dataset.agentId=agent.id;button.addEventListener('click',()=>pickAgent(agent));container.append(button)}if(!token)document.querySelector('#pick-hint').textContent='Öffne diesen Link über den Handy-QR in Lockstep, um Agenten zu picken.';setPicker()}catch{document.querySelector('#pick-status').textContent='Agentenliste konnte nicht geladen werden.'}}
+async function update(){try{const response=await fetch('/api/state',{cache:'no-store'});state=await response.json();document.querySelector('#phase').textContent=state.phase==='PREGAME'?'Agentenauswahl läuft':state.phase==='MENUS'?'Warte auf Lobby …':state.phase==='UNKNOWN'?'Warte auf VALORANT-Verbindung':'Match läuft';document.querySelector('#map').textContent='Map '+(state.mapName||'—');document.querySelector('#agent').textContent='Agent '+(state.agentName||'—');document.querySelector('#pick-hint').textContent=state.canPick?'Tippe auf deinen Agenten, um ihn direkt zu picken.':state.phase==='PREGAME'?'Agentenauswahl läuft; Pick wird verarbeitet …':'Agenten können während der Agentenauswahl gepickt werden.';if(state.mobilePickMessage)document.querySelector('#pick-status').textContent=state.mobilePickMessage;timerEnd=state.timerSeconds==null?0:Date.now()+state.timerSeconds*1000;document.querySelector('#players').innerHTML=(state.players||[]).map(player=>'<tr><td>'+esc(player.name||'Spieler')+'</td><td>'+esc(player.agentName||'Wählt …')+'</td><td class="team">'+esc(teamName(player.team))+'</td></tr>').join('')||'<tr><td class="dim" colspan="3">Keine Spielerdaten</td></tr>';setPicker()}catch{document.querySelector('#phase').textContent='Lockstep ist nicht erreichbar'}}
+function esc(value){return String(value).replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}
+setInterval(()=>{document.querySelector('#timer').textContent='Timer '+(timerEnd?Math.max(0,Math.ceil((timerEnd-Date.now())/1000))+' s':'—')},250);loadAgents();update();setInterval(update,1000);
+</script></body></html>'''
 MAP_NAME_FALLBACKS = {
     "7eaecc1b-4337-bbf6-6ab9-04b8f06b3319": "Ascent",
     "ascent": "Ascent",
@@ -63,31 +97,92 @@ MAP_NAME_FALLBACKS = {
 
 
 class LobbyHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status: int, payload: Any, allow_origin: bool = False) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        if allow_origin:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
-        if self.path == "/api/mobile-url":
+        path = urlsplit(self.path).path
+        if path == "/api/mobile-url":
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                self._send_json(403, {"message": "Nur lokal verfuegbar."})
+                return
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
                 try:
                     probe.connect(("192.0.2.1", 80))
                     address = probe.getsockname()[0]
                 except OSError:
                     address = "127.0.0.1"
-            body = json.dumps({"url": f"http://{address}:47831/"}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-        elif self.path == "/api/state":
+            self._send_json(200, {"url": f"http://{address}:47831/?key={quote(LOBBY_CONTROL_TOKEN)}"}, True)
+            return
+        if path == "/api/state":
             with LOBBY_LOCK:
-                body = json.dumps(LOBBY_STATE).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-        else:
-            body = '''<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lockstep Lobby</title><style>body{margin:0;background:#111210;color:#e8e9e5;font:15px system-ui}main{max-width:900px;margin:8vh auto;padding:28px}h1{font-size:32px}.meta{display:flex;gap:20px;color:#a4a79e}.card{margin-top:24px;border:1px solid #34362f;border-radius:12px;padding:18px;background:#181a17}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px;border-bottom:1px solid #34362f}.dim{color:#92958c}</style><main><p class="dim">LOCKSTEP / LOKALE LOBBY</p><h1>Warte auf Lobby …</h1><div class="meta"><span id="map">Map —</span><span id="agent">Agent —</span><span id="timer">Timer —</span></div><section class="card"><table><thead><tr><th>Spieler</th><th>Agent</th><th>Team</th></tr></thead><tbody id="players"><tr><td class="dim" colspan="3">Warte auf Spielerdaten …</td></tr></tbody></table></section></main><script>let timerEnd=0;async function update(){try{const s=await(await fetch('/api/state')).json();document.querySelector('h1').textContent=s.phase==='PREGAME'?'Agentenauswahl':s.phase==='MENUS'?'Warte auf Lobby …':'Match läuft';document.querySelector('#map').textContent='Map '+(s.mapName||'—');document.querySelector('#agent').textContent='Agent '+(s.agentName||'—');timerEnd=s.timerSeconds==null?0:Date.now()+s.timerSeconds*1000;document.querySelector('#players').innerHTML=(s.players||[]).map(p=>'<tr><td>'+esc(p.name||'Spieler')+'</td><td>'+esc(p.agentName||'Wählt …')+'</td><td>'+esc(p.team||'—')+'</td></tr>').join('')||'<tr><td class="dim" colspan="3">Keine Spielerdaten</td></tr>'}catch{} }function esc(s){return String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]))}setInterval(()=>{document.querySelector('#timer').textContent='Timer '+(timerEnd?Math.max(0,Math.ceil((timerEnd-Date.now())/1000))+' s':'—')},250);update();setInterval(update,1000);</script></html>'''.encode('utf-8')
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+                snapshot = dict(LOBBY_STATE)
+            self._send_json(200, snapshot)
+            return
+        if path == "/api/agents":
+            with LOBBY_LOCK:
+                agents = list(LOBBY_AGENTS)
+            self._send_json(200, agents)
+            return
+        if path != "/":
+            self._send_json(404, {"message": "Nicht gefunden."})
+            return
+        body = MOBILE_LOBBY_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        global LOBBY_PENDING_PICK
+        if urlsplit(self.path).path != "/api/mobile-pick":
+            self._send_json(404, {"message": "Nicht gefunden."})
+            return
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host")
+        if origin and host and urlsplit(origin).netloc.casefold() != host.casefold():
+            self._send_json(403, {"message": "Ungueltige Herkunft."})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 4096:
+                raise ValueError("Ungueltige Anfrage.")
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("Ungueltige Anfrage.")
+        except (ValueError, json.JSONDecodeError):
+            self._send_json(400, {"message": "Ungueltige Anfrage."})
+            return
+        if not hmac.compare_digest(str(payload.get("key") or ""), LOBBY_CONTROL_TOKEN):
+            self._send_json(403, {"message": "QR-Link ungueltig. Bitte neuen QR-Code in Lockstep oeffnen."})
+            return
+        agent_id = str(payload.get("agentId") or "")
+        with LOBBY_LOCK:
+            agent = next((item for item in LOBBY_AGENTS if item["id"] == agent_id), None)
+            if not agent:
+                self._send_json(400, {"message": "Dieser Agent ist nicht verfuegbar."})
+                return
+            if LOBBY_STATE.get("phase") != "PREGAME":
+                self._send_json(409, {"message": "Agenten koennen nur in der Agentenauswahl gepickt werden."})
+                return
+            if LOBBY_PENDING_PICK or not LOBBY_STATE.get("canPick", False):
+                self._send_json(409, {"message": "Ein Pick laeuft bereits oder ist nicht mehr moeglich."})
+                return
+            LOBBY_PENDING_PICK = {"agentId": agent["id"], "agentName": agent["name"]}
+            LOBBY_STATE["canPick"] = False
+            LOBBY_STATE["mobilePickMessage"] = f"{agent['name']} wird ausgewaehlt ..."
+            message = LOBBY_STATE["mobilePickMessage"]
+        self._send_json(202, {"message": message})
 
     def log_message(self, *_args: Any) -> None:
         pass
@@ -104,6 +199,8 @@ def start_lobby_server() -> None:
 def update_lobby(state: dict[str, Any]) -> None:
     with LOBBY_LOCK:
         LOBBY_STATE.update(state)
+        if "canPick" in state:
+            LOBBY_STATE["canPick"] = bool(state["canPick"] and LOBBY_PENDING_PICK is None)
 
 
 def notify_discord(webhook: str, map_name: str, agent_name: str) -> None:
@@ -265,6 +362,26 @@ def read_game_metadata(fallback_region: str) -> tuple[str, str]:
     return region, version
 
 
+def client_entitlements_ready(client: Client) -> tuple[bool, str]:
+    try:
+        lockfile = client._Client__get_lockfile()
+        response = requests.get(
+            f"https://127.0.0.1:{lockfile['port']}/entitlements/v1/token",
+            auth=("riot", lockfile["password"]),
+            verify=False,
+            timeout=3,
+        )
+        payload = response.json()
+    except Exception:
+        return False, "Warte auf VALORANT-Lockfile"
+
+    if response.ok and isinstance(payload, dict) and all(key in payload for key in ("subject", "accessToken", "token")):
+        return True, ""
+    if isinstance(payload, dict) and payload.get("message"):
+        return False, str(payload["message"])
+    return False, f"Entitlements-Antwort unvollständig (HTTP {response.status_code})"
+
+
 def normalize_players(data: dict[str, Any], agent_names: dict[str, str]) -> list[dict[str, Any]]:
     players: list[dict[str, Any]] = []
     teams = data.get("Teams")
@@ -319,13 +436,22 @@ def normalize_player(player: dict[str, Any], team: str, agent_names: dict[str, s
     }
 
 
-def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str, dict[str, str]]) -> None:
+def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str, dict[str, str]], agent_catalog: list[dict[str, str]]) -> None:
+    global LOBBY_CONTROL_TOKEN, LOBBY_AGENTS, LOBBY_PENDING_PICK
+    LOBBY_CONTROL_TOKEN = secrets.token_urlsafe(32)
+    LOBBY_AGENTS = [
+        {"id": str(agent.get("id") or ""), "name": str(agent.get("name") or "")}
+        for agent in agent_catalog
+        if isinstance(agent, dict) and agent.get("id") and agent.get("name")
+    ]
+    LOBBY_PENDING_PICK = None
     start_lobby_server()
     control = {"agent_id": agent_id, "agent_name": agent_name, "map_rules": map_rules, "discord_webhook": os.environ.get("LOCKSTEP_DISCORD_WEBHOOK", "")}
     control_lock = Lock()
     auto_lock_enabled = Event()
 
     def read_commands() -> None:
+        global LOBBY_AGENTS
         for line in sys.stdin:
             try:
                 command = json.loads(line)
@@ -338,6 +464,17 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                 control["agent_name"] = str(command.get("agentName") or control["agent_name"])
                 control["map_rules"] = json.loads(command.get("mapRules") or "{}")
                 control["discord_webhook"] = str(command.get("discordWebhook") or "")
+                try:
+                    catalog = json.loads(command.get("agentCatalog") or "[]")
+                    if isinstance(catalog, list):
+                        with LOBBY_LOCK:
+                            LOBBY_AGENTS = [
+                                {"id": str(agent.get("id") or ""), "name": str(agent.get("name") or "")}
+                                for agent in catalog
+                                if isinstance(agent, dict) and agent.get("id") and agent.get("name")
+                            ]
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if command.get("type") != "auto_lock":
                 continue
             if command.get("enabled"):
@@ -349,6 +486,9 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
 
     Thread(target=read_commands, daemon=True).start()
     print("Lokale Lobby gestartet. Warte auf Valorant-Client …", flush=True)
+    waiting_snapshot = {"phase": "UNKNOWN", "mapName": "", "agentName": "", "region": region, "players": [], "canPick": False, "mobilePickMessage": "", "updatedAt": int(time.time())}
+    update_lobby(waiting_snapshot)
+    print("TRACK:" + json.dumps(waiting_snapshot), flush=True)
     client = None
     last_connect_error = ""
     while client is None:
@@ -359,7 +499,17 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                 region = detected_region
             client = Client(region=region)
             client._Client__get_current_version = lambda: client_version
-            client.activate()
+            ready, wait_reason = client_entitlements_ready(client)
+            if not ready:
+                client = None
+                message = f"Warte auf VALORANT-Verbindung: {wait_reason}"
+                if message != last_connect_error:
+                    print(message, flush=True)
+                    last_connect_error = message
+                time.sleep(3)
+                continue
+            with redirect_stdout(io.StringIO()):
+                client.activate()
         except Exception as error:
             client = None
             message = f"Warte auf Valorant-Client: {error}"
@@ -539,6 +689,26 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                 )
                 active_agent_id = rule.get("agentId") or agent_id
                 active_agent_name = rule.get("agentName") or agent_name
+                mobile_pick = None
+                if match_data.get("ID"):
+                    with LOBBY_LOCK:
+                        if LOBBY_PENDING_PICK is not None:
+                            mobile_pick = LOBBY_PENDING_PICK
+                            LOBBY_PENDING_PICK = None
+                if mobile_pick:
+                    active_agent_id = mobile_pick["agentId"]
+                    active_agent_name = mobile_pick["agentName"]
+                    try:
+                        client.pregame_select_character(active_agent_id, match_data["ID"])
+                        client.pregame_lock_character(active_agent_id, match_data["ID"])
+                        locked = True
+                        message = f"{active_agent_name} wurde gepickt und gelockt."
+                        print(message, flush=True)
+                        update_lobby({"mobilePickMessage": message, "canPick": False})
+                    except Exception as error:
+                        message = f"{active_agent_name} konnte nicht gepickt werden: {error}"
+                        print(message, flush=True)
+                        update_lobby({"mobilePickMessage": message, "canPick": True})
                 if match_data.get("ID"):
                     current_pregame_id = str(match_data["ID"])
                     if notified_pregame_id != current_pregame_id:
@@ -592,6 +762,12 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                             player["assists"] = old_player.get("assists")
                     players = live_players
 
+            if phase != "PREGAME":
+                with LOBBY_LOCK:
+                    if LOBBY_PENDING_PICK is not None:
+                        LOBBY_PENDING_PICK = None
+                        LOBBY_STATE["mobilePickMessage"] = "Die Agentenauswahl ist vorbei; der Pick wurde verworfen."
+
             if previous_phase in ("INGAME", "IN_GAME") and phase not in ("INGAME", "IN_GAME"):
                 awaiting_postgame = True
 
@@ -643,6 +819,7 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                 "agentName": active_agent_name if locked else "",
                 "region": region,
                 "players": players if phase in ("PREGAME", "INGAME", "IN_GAME") else [],
+                "canPick": phase == "PREGAME" and bool(match_data.get("ID")) and not locked,
                 "timerSeconds": max(0, int(timer_ns / 1_000_000_000)) if isinstance(timer_ns, (int, float)) else None,
                 "updatedAt": int(time.time()),
             }
@@ -662,6 +839,7 @@ if __name__ == "__main__":
     parser.add_argument("--agent-name", default="Sage")
     parser.add_argument("--region", choices=("eu", "na", "ap", "kr", "br", "latam"), default="eu")
     parser.add_argument("--rules", default="{}")
+    parser.add_argument("--agents", default="[]")
     parser.add_argument("--catalog", action="store_true")
     args = parser.parse_args()
-    lock_agent(args.agent_id, args.agent_name, args.region, json.loads(args.rules))
+    lock_agent(args.agent_id, args.agent_name, args.region, json.loads(args.rules), json.loads(args.agents))
