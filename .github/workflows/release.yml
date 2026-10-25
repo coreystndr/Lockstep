@@ -44,7 +44,7 @@ jobs:
           $repo = $env:GITHUB_REPOSITORY
           $config = @{
             bundle = @{ resources = @{ "../build/sidecar/lockstep-agent.exe" = "agent/lockstep-agent.exe" } }
-            plugins = @{ updater = @{ endpoints = @("https://github.com/$repo/releases/latest/download/latest.json") } }
+            plugins = @{ updater = @{ endpoints = @("https://github.com/$repo/releases/latest/download/latest.json?current_version={{current_version}}") } }
           }
           $config | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 src-tauri/tauri.release.conf.json
 
