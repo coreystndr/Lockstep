@@ -12,6 +12,7 @@ type MapRule = { agentId: string; agentName: string; mapName: string };
 type TrackSnapshot = { phase?: string; mapId?: string; mapName?: string; agentId?: string; agentName?: string; region?: string; players?: PlayerSnapshot[]; updatedAt?: number };
 const app = document.querySelector<HTMLDivElement>("#app")!;
 let running = false;
+let serviceRunning = false;
 let entries: LogEntry[] = [];
 const sage = fullAgentCatalog.find((agent) => agent.name === "Sage")!;
 const agents: CatalogItem[] = fullAgentCatalog;
@@ -55,7 +56,7 @@ app.innerHTML = `
       <section class="control-panel" aria-labelledby="agent-heading">
         <div class="panel-heading">
           <div><p class="section-index">01 <span>/ SETUP</span></p><h2 id="agent-heading">Konfiguration</h2></div>
-          <div class="connection"><span class="connection-light" id="connection-light"></span><span id="connection-label">Bereit</span></div>
+          <div class="connection"><span class="connection-light" id="connection-light"></span><span id="connection-label">Dienst startet …</span></div>
         </div>
         <div class="fields">
           <label class="field agent-field">
@@ -82,12 +83,12 @@ app.innerHTML = `
         <div id="map-rules" class="map-rules" aria-live="polite"></div>
         <div class="web-tools">
           <label class="field webhook-field"><span>Discord Webhook</span><input id="discord-webhook" type="url" autocomplete="off" spellcheck="false" placeholder="https://discord.com/api/webhooks/…"></label>
-          <div class="lobby-link"><span>Live-Lobby im Browser</span><a id="lobby-url" href="#" target="_blank" rel="noreferrer">Wird beim Start angezeigt</a><small>QR-Code für dein Handy, solange der Lock läuft:</small><button id="show-mobile-qr" class="secondary-button mobile-qr-button" type="button">Handy-QR anzeigen</button><div id="mobile-qr" class="mobile-qr" hidden><canvas id="mobile-qr-canvas" aria-label="QR-Code für die mobile Lobby"></canvas><span id="mobile-qr-status" role="status" aria-live="polite">Verbinde …</span></div></div>
+          <div class="lobby-link"><span>Live-Lobby im Browser</span><a id="lobby-url" href="#" target="_blank" rel="noreferrer">Wird beim Start angezeigt</a><small>Die Lobby läuft, solange Lockstep geöffnet ist.</small><button id="show-mobile-qr" class="secondary-button mobile-qr-button" type="button">Handy-QR anzeigen</button><div id="mobile-qr" class="mobile-qr" hidden><canvas id="mobile-qr-canvas" aria-label="QR-Code für die mobile Lobby"></canvas><span id="mobile-qr-status" role="status" aria-live="polite">Verbinde …</span></div></div>
         </div>
         <div class="action-row">
-          <div class="action-note"><span class="key-hint">${running ? "RUNNING" : "AUTO"}</span><span id="action-copy">${running ? "Suche nach einem Match" : "Sobald das Match startet, wird der Agent gewählt."}</span></div>
+          <div class="action-note"><span class="key-hint" id="auto-lock-state">AUTO-LOCK AUS</span><span id="action-copy">Tracking und Lobby laufen im Hintergrund.</span></div>
           <button id="toggle-agent" class="primary-button ${running ? "is-stop" : ""}" type="button">
-            <span class="button-icon" aria-hidden="true">${running ? "■" : "▶"}</span><span>${running ? "Stoppen" : "Lock starten"}</span>
+            <span class="button-icon" aria-hidden="true">${running ? "■" : "▶"}</span><span>${running ? "Auto-Lock pausieren" : "Auto-Lock starten"}</span>
           </button>
         </div>
         <p class="compat-note">Die valclient-Dokumentation rät von automatischem Instalocking ab.</p>
@@ -144,6 +145,31 @@ const mobileQrButton = document.querySelector<HTMLButtonElement>("#show-mobile-q
 const mobileQr = document.querySelector<HTMLDivElement>("#mobile-qr")!;
 const mobileQrCanvas = document.querySelector<HTMLCanvasElement>("#mobile-qr-canvas")!;
 const mobileQrStatus = document.querySelector<HTMLSpanElement>("#mobile-qr-status")!;
+button.disabled = true;
+
+function agentConfig() {
+  const agent = agents.find((item) => item.id === agentSelect.value) || sage;
+  return {
+    agentId: agent.id,
+    agentName: agent.name,
+    region: regionSelect.value,
+    mapRules: JSON.stringify(mapRules),
+    discordWebhook: webhookInput.value.trim() || null,
+  };
+}
+
+async function startBackgroundService() {
+  await invoke("start_agent", agentConfig());
+}
+
+async function updateBackgroundConfig() {
+  if (!serviceRunning || running) return;
+  try {
+    await invoke("update_agent_config", agentConfig());
+  } catch (error) {
+    addLog(String(error));
+  }
+}
 
 agentPicker.addEventListener("click", (event) => {
   const choice = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-agent-id]");
@@ -157,6 +183,18 @@ agentSelect.addEventListener("change", () => {
     choice.classList.toggle("is-selected", selected);
     choice.setAttribute("aria-pressed", String(selected));
   });
+  void updateBackgroundConfig();
+});
+webhookInput.addEventListener("change", () => { void updateBackgroundConfig(); });
+regionSelect.addEventListener("change", async () => {
+  if (!serviceRunning || running) return;
+  try {
+    await invoke("stop_agent");
+    setAgentStatus(false, false);
+    await startBackgroundService();
+  } catch (error) {
+    addLog(String(error));
+  }
 });
 mobileQrButton.addEventListener("click", async () => {
   mobileQr.hidden = false;
@@ -303,40 +341,32 @@ function addLog(text: string) {
   document.querySelector("#footer-state")!.textContent = text;
 }
 
-function setRunning(value: boolean) {
-  running = value;
-  button.classList.toggle("is-stop", value);
-  button.innerHTML = `<span class="button-icon" aria-hidden="true">${value ? "■" : "▶"}</span><span>${value ? "Stoppen" : "Lock starten"}</span>`;
-  document.querySelector("#connection-light")!.classList.toggle("is-live", value);
-  document.querySelector("#connection-label")!.textContent = value ? "Agent aktiv" : "Bereit";
-  document.querySelector("#action-copy")!.textContent = value ? "Suche nach einem Match" : "Sobald das Match startet, wird der Agent gewählt.";
-  document.querySelector("#footer-state")!.textContent = value ? "Warte auf Match" : "Warte auf Start";
-  if (!value) {
-    document.querySelector("#live-phase")!.textContent = "Nicht aktiv";
-    document.querySelector("#live-indicator")!.classList.remove("is-live");
-  } else {
-    document.querySelector("#live-phase")!.textContent = "Verbinde …";
-  }
-  for (const field of [agentSelect, regionSelect, ruleMapSelect, ruleAgentSelect, webhookInput, document.querySelector<HTMLButtonElement>("#save-rule")!]) field.disabled = value;
-  agentPicker.querySelectorAll<HTMLButtonElement>(".agent-choice").forEach((choice) => { choice.disabled = value; });
-  document.querySelectorAll<HTMLButtonElement>("[data-remove-rule]").forEach((removeButton) => { removeButton.disabled = value; });
+function setAgentStatus(value: boolean, service: boolean) {
+  running = value && service;
+  serviceRunning = service;
+  button.classList.toggle("is-stop", running);
+  button.disabled = !service;
+  button.innerHTML = `<span class="button-icon" aria-hidden="true">${running ? "■" : "▶"}</span><span>${running ? "Auto-Lock pausieren" : "Auto-Lock starten"}</span>`;
+  document.querySelector("#connection-light")!.classList.toggle("is-live", service);
+  document.querySelector("#connection-label")!.textContent = service ? (running ? "Tracker aktiv · Auto-Lock an" : "Tracker aktiv") : "Tracker nicht aktiv";
+  document.querySelector("#auto-lock-state")!.textContent = running ? "AUTO-LOCK AN" : "AUTO-LOCK AUS";
+  document.querySelector("#action-copy")!.textContent = running ? "Auto-Lock wartet auf ein Match." : service ? "Tracking und Lobby laufen im Hintergrund." : "Tracking-Dienst wird gestartet.";
+  document.querySelector("#footer-state")!.textContent = running ? "Auto-Lock aktiv · warte auf Match" : service ? "Tracking und Lobby aktiv" : "Tracking-Dienst nicht aktiv";
+  for (const field of [agentSelect, regionSelect, ruleMapSelect, ruleAgentSelect, webhookInput, document.querySelector<HTMLButtonElement>("#save-rule")!]) field.disabled = running;
+  agentPicker.querySelectorAll<HTMLButtonElement>(".agent-choice").forEach((choice) => { choice.disabled = running; });
+  document.querySelectorAll<HTMLButtonElement>("[data-remove-rule]").forEach((removeButton) => { removeButton.disabled = running; });
 }
 
 button.addEventListener("click", async () => {
   button.disabled = true;
+  const nextState = !running;
   try {
-    if (running) {
-      await invoke("stop_agent");
-      setRunning(false);
-    } else {
-      const agent = agents.find((item) => item.id === agentSelect.value) || sage;
-      await invoke("start_agent", { agentId: agent.id, agentName: agent.name, region: regionSelect.value, mapRules: JSON.stringify(mapRules), discordWebhook: webhookInput.value.trim() || null });
-      setRunning(true);
-    }
+    await invoke("set_auto_lock", { ...agentConfig(), enabled: nextState });
+    setAgentStatus(nextState, serviceRunning);
   } catch (error) {
     addLog(String(error));
   } finally {
-    button.disabled = false;
+    button.disabled = !serviceRunning;
   }
 });
 
@@ -347,6 +377,7 @@ document.querySelector("#save-rule")!.addEventListener("click", () => {
   if (!map || !agent) return;
   mapRules[map.id] = { agentId: agent.id, agentName: agent.name, mapName: map.name };
   saveRules();
+  void updateBackgroundConfig();
   addLog(`${agent.name} für ${map.name} gespeichert.`);
 });
 document.querySelector("#map-rules")!.addEventListener("click", (event) => {
@@ -354,12 +385,13 @@ document.querySelector("#map-rules")!.addEventListener("click", (event) => {
   if (!button) return;
   delete mapRules[button.dataset.removeRule || ""];
   saveRules();
+  void updateBackgroundConfig();
 });
 renderMapRules();
 
 const listenersReady = Promise.all([
   listen<string>("agent-log", (event) => addLog(event.payload)),
-  listen<{ running: boolean }>("agent-status", (event) => setRunning(event.payload.running)),
+  listen<{ running: boolean; serviceRunning: boolean }>("agent-status", (event) => setAgentStatus(event.payload.running, event.payload.serviceRunning)),
   listen<TrackSnapshot>("agent-track", (event) => {
   const snapshot = event.payload;
   const phases: Record<string, string> = { PREGAME: "Agentenauswahl", INGAME: "Im Match", IN_GAME: "Im Match", MENUS: "Im Menü", UNKNOWN: "Status wird gesucht" };
@@ -385,6 +417,12 @@ const listenersReady = Promise.all([
 ]);
 void listenersReady.catch((error) => addLog(`Listener konnten nicht gestartet werden: ${String(error)}`));
 void listenersReady.then(async () => {
+  try {
+    await startBackgroundService();
+  } catch (error) {
+    addLog(`Tracking-Dienst konnte nicht gestartet werden: ${String(error)}`);
+    setAgentStatus(false, false);
+  }
   try {
     await checkForUpdate(true);
   } catch (error) {

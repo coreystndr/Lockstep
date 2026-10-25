@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
-use std::{io::{BufRead, BufReader}, path::PathBuf, process::{Child, Command, Stdio}, sync::Mutex, thread, time::Duration};
+use std::{io::{BufRead, BufReader, Write}, path::PathBuf, process::{Child, ChildStdin, Command, Stdio}, sync::Mutex, thread, time::Duration};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -9,10 +9,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-struct AgentProcess(Mutex<Option<Child>>);
+struct ManagedAgent { child: Child, input: ChildStdin }
+struct AgentProcess(Mutex<Option<ManagedAgent>>);
 
 #[derive(Clone, Serialize)]
-struct AgentStatus { running: bool }
+#[serde(rename_all = "camelCase")]
+struct AgentStatus { running: bool, service_running: bool }
 
 fn agent_runtime(app: &AppHandle) -> Result<(PathBuf, bool), String> {
     if let Ok(resources) = app.path().resource_dir() {
@@ -62,6 +64,7 @@ fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String,
             .arg("--agent-name").arg(&agent_name)
             .arg("--region").arg(&region)
             .arg("--rules").arg(&map_rules)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         {
             Ok(child) => {
@@ -82,7 +85,8 @@ fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String,
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    *process = Some(child);
+    let input = child.stdin.take().ok_or("Eingabekanal zum Lockstep-Agent fehlt.")?;
+    *process = Some(ManagedAgent { child, input });
     drop(process);
 
     if let Some(pipe) = stdout { read_output(app.clone(), pipe, false); }
@@ -93,26 +97,81 @@ fn start_agent(app: AppHandle, state: State<'_, AgentProcess>, agent_id: String,
         thread::sleep(Duration::from_millis(400));
         let Some(state) = app_for_monitor.try_state::<AgentProcess>() else { break };
         let Ok(mut process) = state.0.lock() else { break };
-        let Some(child) = process.as_mut() else { break };
-        match child.try_wait() {
+        let Some(agent) = process.as_mut() else { break };
+        match agent.child.try_wait() {
             Ok(Some(status)) => {
                 *process = None;
                 let message = if status.success() { "Agent beendet.".to_string() } else { format!("Agent beendet mit Status {status}.") };
                 let _ = app_for_monitor.emit("agent-log", message);
-                let _ = app_for_monitor.emit("agent-status", AgentStatus { running: false });
+                let _ = app_for_monitor.emit("agent-status", AgentStatus { running: false, service_running: false });
                 break;
             }
             Err(error) => {
                 *process = None;
                 let _ = app_for_monitor.emit("agent-log", format!("Prozessfehler: {error}"));
-                let _ = app_for_monitor.emit("agent-status", AgentStatus { running: false });
+                let _ = app_for_monitor.emit("agent-status", AgentStatus { running: false, service_running: false });
                 break;
             }
             _ => {}
         }
     });
-    let _ = app.emit("agent-status", AgentStatus { running: true });
+    let _ = app.emit("agent-status", AgentStatus { running: false, service_running: true });
     Ok(())
+}
+
+#[tauri::command]
+fn set_auto_lock(app: AppHandle, state: State<'_, AgentProcess>, enabled: bool, agent_id: String, agent_name: String, map_rules: String, discord_webhook: Option<String>) -> Result<(), String> {
+    let mut process = state.0.lock().map_err(|e| e.to_string())?;
+    let agent = process.as_mut().ok_or("Der Tracking-Dienst ist noch nicht gestartet.")?;
+    let command = serde_json::json!({
+        "type": "auto_lock",
+        "enabled": enabled,
+        "agentId": agent_id,
+        "agentName": agent_name,
+        "mapRules": map_rules,
+        "discordWebhook": discord_webhook.unwrap_or_default(),
+    });
+    writeln!(agent.input, "{command}").map_err(|error| format!("Auto-Lock konnte nicht aktualisiert werden: {error}"))?;
+    agent.input.flush().map_err(|error| format!("Auto-Lock-Befehl konnte nicht gesendet werden: {error}"))?;
+    let _ = app.emit("agent-status", AgentStatus { running: enabled, service_running: true });
+    Ok(())
+}
+
+#[tauri::command]
+fn update_agent_config(state: State<'_, AgentProcess>, agent_id: String, agent_name: String, map_rules: String, discord_webhook: Option<String>) -> Result<(), String> {
+    let mut process = state.0.lock().map_err(|e| e.to_string())?;
+    let agent = process.as_mut().ok_or("Der Tracking-Dienst läuft noch nicht.")?;
+    let command = serde_json::json!({
+        "type": "configure",
+        "agentId": agent_id,
+        "agentName": agent_name,
+        "mapRules": map_rules,
+        "discordWebhook": discord_webhook.unwrap_or_default(),
+    });
+    writeln!(agent.input, "{command}").map_err(|error| format!("Konfiguration konnte nicht aktualisiert werden: {error}"))?;
+    agent.input.flush().map_err(|error| format!("Konfiguration konnte nicht gesendet werden: {error}"))?;
+    Ok(())
+}
+
+fn terminate_agent(agent: &mut ManagedAgent) {
+    if agent.child.try_wait().ok().flatten().is_none() {
+        #[cfg(windows)]
+        {
+            let pid = agent.child.id().to_string();
+            let mut taskkill = Command::new("taskkill");
+            taskkill.args(["/PID", &pid, "/T", "/F"]);
+            taskkill.creation_flags(CREATE_NO_WINDOW);
+            let tree_stopped = taskkill.status().map(|status| status.success()).unwrap_or(false);
+            if !tree_stopped && agent.child.try_wait().ok().flatten().is_none() {
+                let _ = agent.child.kill();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = agent.child.kill();
+        }
+    }
+    let _ = agent.child.wait();
 }
 
 fn read_output(app: AppHandle, pipe: impl std::io::Read + Send + 'static, is_error: bool) {
@@ -133,29 +192,14 @@ fn read_output(app: AppHandle, pipe: impl std::io::Read + Send + 'static, is_err
 #[tauri::command]
 fn stop_agent(app: AppHandle, state: State<'_, AgentProcess>) -> Result<(), String> {
     let mut process = state.0.lock().map_err(|e| e.to_string())?;
-    let child = process.take();
+    let mut agent = process.take();
     drop(process);
 
-    if let Some(mut child) = child {
-        if child.try_wait().map_err(|e| format!("Prozessstatus konnte nicht gelesen werden: {e}"))?.is_none() {
-            #[cfg(windows)]
-            {
-                let pid = child.id().to_string();
-                let mut taskkill = Command::new("taskkill");
-                taskkill.args(["/PID", &pid, "/T", "/F"]);
-                taskkill.creation_flags(CREATE_NO_WINDOW);
-                let tree_stopped = taskkill.status().map(|status| status.success()).unwrap_or(false);
-                if !tree_stopped && child.try_wait().ok().flatten().is_none() {
-                    child.kill().map_err(|e| format!("Agent konnte nicht gestoppt werden: {e}"))?;
-                }
-            }
-            #[cfg(not(windows))]
-            child.kill().map_err(|e| format!("Agent konnte nicht gestoppt werden: {e}"))?;
-        }
-        child.wait().map_err(|e| format!("Agent-Prozess konnte nicht beendet werden: {e}"))?;
+    if let Some(agent) = agent.as_mut() {
+        terminate_agent(agent);
     }
-    let _ = app.emit("agent-log", "Lock-Vorgang gestoppt.");
-    let _ = app.emit("agent-status", AgentStatus { running: false });
+    let _ = app.emit("agent-log", "Tracking-Dienst beendet.");
+    let _ = app.emit("agent-status", AgentStatus { running: false, service_running: false });
     Ok(())
 }
 
@@ -164,7 +208,19 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AgentProcess(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![start_agent, stop_agent])
+        .invoke_handler(tauri::generate_handler![start_agent, set_auto_lock, update_agent_config, stop_agent])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if let Some(state) = window.app_handle().try_state::<AgentProcess>() {
+                    if let Ok(mut process) = state.0.lock() {
+                        if let Some(agent) = process.as_mut() {
+                            terminate_agent(agent);
+                        }
+                        process.take();
+                    }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("Fehler beim Starten von Lockstep");
 }

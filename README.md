@@ -1,8 +1,8 @@
 # Lockstep
 
-Lockstep is a Tauri desktop control for the Python script in `main.py`. It starts the script, forwards its output to the activity log, and can stop it. The live panel polls session state every two seconds and shows the phase, map, selected agent, and region when the client reports them. The agent and map dropdowns use a bundled catalog, so they are available without a Riot login or internet connection. Per-map agent rules persist in the app.
+Lockstep is a Tauri desktop control for the Python script in `main.py`. It starts the tracker on launch, forwards its output to the activity log, and stops the service when the app closes. Auto-Lock can be enabled or paused separately. The live panel polls session state every two seconds and shows the phase, map, selected agent, and region when the client reports them. The agent and map dropdowns use a bundled catalog, so they are available without a Riot login or internet connection. Per-map agent rules persist in the app.
 
-When the lock process is running, a lobby page is served on port `47831`. Use **Handy-QR anzeigen** in the desktop app to open it on a phone connected to the same Wi-Fi network. The server listens on the local network so the phone can reach the current map, agent-selection countdown, and teammate picks. An optional Discord webhook can be entered in the desktop app; it receives one short message for each newly found lobby.
+When Lockstep opens, the local tracker and lobby start immediately and wait for Valorant to become available. Auto-Lock stays paused until **Auto-Lock starten** is selected; that control only enables automatic agent selection. The lobby page is served on port `47831`. Use **Handy-QR anzeigen** to open it on a phone connected to the same Wi-Fi network and view the current map, agent-selection countdown, and teammate picks. An optional Discord webhook can be entered in the desktop app; it receives one short message for each newly found lobby.
 
 ## Development
 

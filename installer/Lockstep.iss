@@ -1,5 +1,5 @@
 #define AppName "Lockstep"
-#define AppVersion "0.2.5"
+#define AppVersion "0.2.6"
 #define AppPublisher "Lockstep"
 
 [Setup]

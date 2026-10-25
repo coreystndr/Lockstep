@@ -5,8 +5,9 @@ import json
 import os
 import re
 import socket
+import sys
 import time
-from threading import Thread, Lock
+from threading import Event, Thread, Lock
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -320,16 +321,52 @@ def normalize_player(player: dict[str, Any], team: str, agent_names: dict[str, s
 
 def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str, dict[str, str]]) -> None:
     start_lobby_server()
-    try:
-        detected_region, client_version = read_game_metadata(region)
-    except Exception as error:
-        raise RuntimeError(f"Valorant-Clientdaten fehlen: {error}") from error
-    if detected_region != region:
-        print(f"Region aus Spiel-Log verwendet: {detected_region.upper()}", flush=True)
-        region = detected_region
-    client = Client(region=region)
-    client._Client__get_current_version = lambda: client_version
-    client.activate()
+    control = {"agent_id": agent_id, "agent_name": agent_name, "map_rules": map_rules, "discord_webhook": os.environ.get("LOCKSTEP_DISCORD_WEBHOOK", "")}
+    control_lock = Lock()
+    auto_lock_enabled = Event()
+
+    def read_commands() -> None:
+        for line in sys.stdin:
+            try:
+                command = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(command, dict) or command.get("type") not in ("auto_lock", "configure"):
+                continue
+            with control_lock:
+                control["agent_id"] = str(command.get("agentId") or control["agent_id"])
+                control["agent_name"] = str(command.get("agentName") or control["agent_name"])
+                control["map_rules"] = json.loads(command.get("mapRules") or "{}")
+                control["discord_webhook"] = str(command.get("discordWebhook") or "")
+            if command.get("type") != "auto_lock":
+                continue
+            if command.get("enabled"):
+                auto_lock_enabled.set()
+                print("Auto-Lock aktiviert.", flush=True)
+            else:
+                auto_lock_enabled.clear()
+                print("Auto-Lock pausiert. Tracking und Lobby laufen weiter.", flush=True)
+
+    Thread(target=read_commands, daemon=True).start()
+    print("Lokale Lobby gestartet. Warte auf Valorant-Client …", flush=True)
+    client = None
+    last_connect_error = ""
+    while client is None:
+        try:
+            detected_region, client_version = read_game_metadata(region)
+            if detected_region != region:
+                print(f"Region aus Spiel-Log verwendet: {detected_region.upper()}", flush=True)
+                region = detected_region
+            client = Client(region=region)
+            client._Client__get_current_version = lambda: client_version
+            client.activate()
+        except Exception as error:
+            client = None
+            message = f"Warte auf Valorant-Client: {error}"
+            if message != last_connect_error:
+                print(message, flush=True)
+                last_connect_error = message
+            time.sleep(3)
     agent_names: dict[str, str] = {
         canonical_id(agent_id): name for agent_id, name in {
             "41fb69c1-4189-7b37-f117-bcaf1e96f1bf": "Astra",
@@ -417,8 +454,19 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
     last_error = ""
     last_error_at = 0.0
     notified_pregame_id = ""
+    was_auto_lock_enabled = False
     while True:
         try:
+            with control_lock:
+                agent_id = control["agent_id"]
+                agent_name = control["agent_name"]
+                map_rules = control["map_rules"]
+                discord_webhook = control["discord_webhook"]
+            lock_enabled = auto_lock_enabled.is_set()
+            if lock_enabled and not was_auto_lock_enabled and pregame_id:
+                pregame_started_at = time.monotonic()
+                lock_delay_announced_id = ""
+            was_auto_lock_enabled = lock_enabled
             try:
                 presence = client.fetch_presence() or {}
             except Exception as error:
@@ -491,11 +539,13 @@ def lock_agent(agent_id: str, agent_name: str, region: str, map_rules: dict[str,
                 )
                 active_agent_id = rule.get("agentId") or agent_id
                 active_agent_name = rule.get("agentName") or agent_name
-                if not locked and match_data.get("ID"):
+                if match_data.get("ID"):
                     current_pregame_id = str(match_data["ID"])
                     if notified_pregame_id != current_pregame_id:
                         notified_pregame_id = current_pregame_id
-                        Thread(target=notify_discord, args=(os.environ.get("LOCKSTEP_DISCORD_WEBHOOK", ""), map_name, active_agent_name), daemon=True).start()
+                        Thread(target=notify_discord, args=(discord_webhook, map_name, active_agent_name), daemon=True).start()
+                if not locked and match_data.get("ID") and lock_enabled:
+                    current_pregame_id = str(match_data["ID"])
                     delay_remaining = 5.0 - (time.monotonic() - pregame_started_at)
                     if delay_remaining > 0:
                         if lock_delay_announced_id != current_pregame_id:

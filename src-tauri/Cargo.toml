@@ -1,6 +1,6 @@
 [package]
 name = "lockstep"
-version = "0.2.5"
+version = "0.2.6"
 description = "Valorant agent lock controller"
 authors = ["you"]
 edition = "2021"
