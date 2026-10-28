@@ -15,6 +15,7 @@ export const agents: CatalogItem[] = [
   { id: "add6443a-41bd-e414-f6ad-e58d267f4e95", name: "Jett" },
   { id: "601dbbe7-43ce-be57-2a40-4abd24953621", name: "KAY/O" },
   { id: "1e58de9c-4950-5125-93e9-a0aee9f98746", name: "Killjoy" },
+  { id: "ddd5a15c-4fbe-42fa-3789-11a55ca5ee04", name: "Hush" },
   { id: "7c8a4701-4de6-9355-b254-e09bc2a34b72", name: "Miks" },
   { id: "bb2a4828-46eb-8cd1-e765-15848195d751", name: "Neon" },
   { id: "8e253930-4c05-31dd-1b6c-968525494517", name: "Omen" },
